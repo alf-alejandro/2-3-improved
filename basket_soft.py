@@ -1,34 +1,31 @@
 """
-basket_soft.py — Estrategia Espejo de Reversal v2 (Momentum del lado favorecido)
+basket_soft.py — Estrategia Momentum Armónica v2  (Espejo de Reversal)
 
 LÓGICA:
-  Misma detección que basket_reversal: busca el activo con mayor gap negativo
-  respecto a la media armónica de sus pares (gap <= -10bp), con consenso SOFT.
+  Idéntico a basket_reversal.py en TODOS los filtros y detección.
+  La única diferencia: en vez de comprar el lado contrario al gap (~0.30),
+  compramos el lado DEL gap (~0.65–0.70).
 
-  DIFERENCIA CLAVE: basket_reversal compra el lado CON el gap (~0.30, el "barato").
-  basket_soft compra el lado OPUESTO al gap (~0.65–0.70, el "favorecido por el mercado").
+  Hipótesis: si reversal pierde consistentemente al comprar ~0.30,
+  entonces comprar el lado ~0.65–0.70 debería ganar consistentemente.
 
   Ejemplo A — gap detectado en UP:
-    UP de SOL cotiza ~0.30 (barato vs. media armónica) → gap_side = "UP"
-    → compramos DOWN a ~0.65–0.70  (el lado que el mercado favorece)
-    → si resuelve DOWN: ganamos (1/0.65 - 1) × $3.75 ≈ +$2.02
-    → si resuelve UP:   perdemos $3.75
-
-  Ejemplo B — gap detectado en DOWN:
-    DOWN de ETH cotiza ~0.30 → gap_side = "DOWN"
-    → compramos UP a ~0.65–0.70
-    → si resuelve UP:   ganamos ~+$2.02
+    UP de SOL cotiza ~0.65 (barato vs. media armónica)
+    → compramos UP a ~0.65
+    → si resuelve UP:   ganamos (1/0.65 - 1) × $3.75 ≈ +$2.02
     → si resuelve DOWN: perdemos $3.75
 
-  Hipótesis: si el mercado ha "elegido" un lado (~0.65+), seguir al mercado
-  debería ganar más que apostar contra él (como hacía reversal con ~0.30).
+  Ejemplo B — gap detectado en DOWN:
+    DOWN de ETH cotiza ~0.65
+    → compramos DOWN a ~0.65
+    → si resuelve DOWN: ganamos ~+$2.02
+    → si resuelve UP:   perdemos $3.75
 
-PARÁMETROS vs basket_reversal:
-  - ENTRY_MIN_PRICE = 0.65 / ENTRY_MAX_PRICE = 0.70  (lado opuesto al gap)
-  - ENTRY_USD = $3.75  (payout menor que reversal pero win rate esperado mayor)
+DIFERENCIAS vs basket_reversal.py:
+  - Compra el lado CON el gap (el "barato" ~0.65–0.70)
+  - ENTRY_MIN_PRICE = 0.65 / ENTRY_MAX_PRICE = 0.70
   - Todo lo demás idéntico: misma detección, mismo consenso SOFT,
     mismo umbral -10bp, misma ventana, mismo loop
-  - gap_side = lado donde se detectó el gap; side = lado que compramos (opuesto)
 """
 
 import asyncio
@@ -458,9 +455,8 @@ def check_entry():
     if gap > -REVERSAL_THRESHOLD:
         return
 
-    sym      = bt["signal_asset"]
-    gap_side = bt["signal_side"]                         # lado barato (~0.30) — donde está el gap
-    side     = "DOWN" if gap_side == "UP" else "UP"      # ← compramos el lado OPUESTO al gap (~0.65–0.70)
+    sym  = bt["signal_asset"]
+    side = bt["signal_side"]   # ← compramos el lado DEL gap (no el contrario)
 
     if side == "UP":
         entry_ask = markets[sym]["up_ask"]
@@ -500,7 +496,7 @@ def check_entry():
     secs           = min_secs_remaining() or 0
     peers          = [s for s in SYMBOLS if s != sym]
     peer_snaps     = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
-    harm_entry     = bt["harm_up"] if gap_side == "UP" else bt["harm_dn"]
+    harm_entry     = bt["harm_up"] if side == "UP" else bt["harm_dn"]
     gap_entry      = bt["signal_div"]
     capital_before = bt["capital"]
 
@@ -509,8 +505,8 @@ def check_entry():
 
     bt["position"] = {
         "asset":           sym,
-        "side":            side,       # lado comprado (~0.65–0.70)
-        "gap_side":        gap_side,   # lado donde se detectó el gap (~0.30)
+        "side":            side,
+        "gap_side":        side,
         "entry_price":     entry_ask,
         "entry_bid":       entry_bid,
         "entry_mid":       entry_mid,
@@ -526,8 +522,8 @@ def check_entry():
     }
 
     log_event(
-        f"SOFT {side} {sym} @ ask={entry_ask:.4f} | "
-        f"gap_side={gap_side} {gap_entry*100:+.1f}bp | "
+        f"MOMENTUM {side} {sym} @ ask={entry_ask:.4f} | "
+        f"gap={gap_entry*100:+.1f}bp (<= -{REVERSAL_THRESHOLD*100:.1f}bp) | "
         f"harm={harm_entry:.4f} | shares={shares:.4f} | capital=${bt['capital']:.2f}"
     )
     write_state()
@@ -541,7 +537,7 @@ def _apply_resolution(pos, resolved):
     sym  = pos["asset"]
     side = pos["side"]
     if resolved == side:
-        pnl     = round((pos["shares"] - 1) * pos["entry_usd"], 6)
+        pnl     = round(pos["shares"] - pos["entry_usd"], 6)
         outcome = "WIN"
         bt["wins"] += 1
     else:
