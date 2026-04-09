@@ -63,8 +63,7 @@ CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
 ENTRY_MIN_PRICE      = 0.65
-STOP_LOSS_PRICE      = 0.33
-MID_HISTORY_SIZE     = 3
+MID_HISTORY_SIZE     = 10   # 5 segundos a 0.5s de poll → resolución confirmada
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
@@ -374,18 +373,17 @@ async def fetch_all():
 
 def compute_signals():
     def normalized_up(s):
+        # Usar precio real — NO clampear 0.98 a 1.0.
+        # Clampearlo aplana la harmonica y destruye la divergencia armonica
+        # cuando un activo esta en 0.98/0.99 pero sin confirmar resolucion.
         mid = markets[s]["up_mid"]
-        if mid >= RESOLVED_UP_THRESH:
-            return 1.0
-        if mid <= RESOLVED_DN_THRESH:
+        if mid <= 0:
             return 0.0
         return mid
 
     def normalized_dn(s):
         mid = markets[s]["dn_mid"]
-        if mid >= RESOLVED_UP_THRESH:
-            return 1.0
-        if mid <= RESOLVED_DN_THRESH:
+        if mid <= 0:
             return 0.0
         return mid
 
@@ -450,11 +448,10 @@ def _build_single_position(sym: str, side: str, secs: float,
         log_event(f"SKIP {side} {sym} — ask inválido ({entry_ask:.4f})")
         return None
 
-    up_mid = markets[sym]["up_mid"]
-    dn_mid = markets[sym]["dn_mid"]
-    if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
-       dn_mid >= RESOLVED_UP_THRESH or dn_mid <= RESOLVED_DN_THRESH:
-        log_event(f"SKIP {side} {sym} — activo ya resuelto (up={up_mid:.4f} dn={dn_mid:.4f})")
+    # Solo bloquear si el activo esta CONFIRMADAMENTE resuelto (5s sostenidos)
+    # Un tick momentaneo en 0.98/0.02 NO descarta la posicion
+    if _is_confirmed_resolved(sym) is not None:
+        log_event(f"SKIP {side} {sym} — activo confirmado resuelto (5s sostenidos)")
         return None
 
     if entry_ask < ENTRY_MIN_PRICE:
@@ -543,32 +540,6 @@ def check_entry():
     write_state()
 
 
-def check_stop_loss():
-    if not bt["positions"]:
-        return
-
-    cerradas = []
-    for pos in bt["positions"]:
-        sym  = pos["asset"]
-        side = pos["side"]
-        current_bid = markets[sym]["up_bid"] if side == "UP" else markets[sym]["dn_bid"]
-
-        if current_bid <= STOP_LOSS_PRICE and current_bid > 0:
-            pnl = round(pos["shares"] * current_bid - ENTRY_USD, 6)
-            bt["capital"]   += ENTRY_USD + pnl
-            bt["total_pnl"] += pnl
-            bt["losses"]    += 1
-            update_drawdown()
-            log_event(f"STOP LOSS {side} {sym} @ bid={current_bid:.4f} | PnL=${pnl:+.4f}")
-            _record_trade_sl(pos, current_bid, pnl)
-            cerradas.append(pos)
-
-    for pos in cerradas:
-        bt["positions"].remove(pos)
-
-    if cerradas:
-        write_state()
-
 
 def _apply_resolution(pos, resolved):
     sym  = pos["asset"]
@@ -591,6 +562,26 @@ def _apply_resolution(pos, resolved):
     _record_trade(pos, resolved, outcome, pnl)
 
 
+RESOLUTION_CONFIRM_SAMPLES = 10   # 10 muestras x 0.5s = 5s sostenidos
+
+
+def _is_confirmed_resolved(sym):
+    """Retorna 'UP', 'DOWN' o None.
+    Solo resuelve si TODAS las ultimas RESOLUTION_CONFIRM_SAMPLES muestras
+    del mid_history superan los umbrales — evita falsos positivos por un
+    tick momentaneo en 0.98 cuando el mercado sigue activo.
+    """
+    history = list(mid_history[sym])
+    if len(history) < RESOLUTION_CONFIRM_SAMPLES:
+        return None  # historia insuficiente — no resolver todavia
+    recent = history[-RESOLUTION_CONFIRM_SAMPLES:]
+    if all(v >= RESOLVED_UP_THRESH for v in recent):
+        return "UP"
+    if all(v <= RESOLVED_DN_THRESH for v in recent):
+        return "DOWN"
+    return None
+
+
 def check_resolution():
     if not bt["positions"]:
         return
@@ -598,13 +589,8 @@ def check_resolution():
     cerradas = []
     for pos in bt["positions"]:
         sym    = pos["asset"]
-        up_mid = markets[sym]["up_mid"]
 
-        resolved = None
-        if up_mid >= RESOLVED_UP_THRESH:
-            resolved = "UP"
-        elif up_mid <= RESOLVED_DN_THRESH:
-            resolved = "DOWN"
+        resolved = _is_confirmed_resolved(sym)
 
         if resolved:
             _apply_resolution(pos, resolved)
@@ -656,7 +642,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
     p1_side_mid, p1_opp_mid = peer_mids(peers[0]) if len(peers) > 0 else (0.0, 0.0)
     p2_side_mid, p2_opp_mid = peer_mids(peers[1]) if len(peers) > 1 else (0.0, 0.0)
 
-    sl_price = STOP_LOSS_PRICE
+    sl_price = 0.0
     max_win  = round((1.0 - pos["entry_price"]) / pos["entry_price"] * pos["entry_usd"], 6)
 
     binary_win = 1 if outcome == "WIN" and exit_type == "RESOLUTION" else \
@@ -717,11 +703,6 @@ def _record_trade(pos, resolved, outcome, pnl):
     _save_log()
 
 
-def _record_trade_sl(pos, exit_bid, pnl):
-    record = _build_trade_record(pos, "STOP_LOSS", exit_bid, None, "LOSS", pnl)
-    bt["trades"].append(record)
-    _save_csv(record)
-    _save_log()
 
 
 def _save_log():
@@ -795,8 +776,6 @@ async def main_loop():
                 secs > ENTRY_CLOSE_SECS
             )
 
-            if bt["positions"]:
-                check_stop_loss()
             if bt["positions"]:
                 check_resolution()
 
