@@ -4,7 +4,12 @@ strategy_core.py — Market discovery + order book metrics + signal engine
 Configurable via env vars:
   SYMBOL = SOL | BTC   (default: SOL)
 
-v2: agrega find_active_market(symbol) para soportar ETH, SOL y BTC simultaneamente.
+v3: fetch_market_resolution corregido:
+  - Parámetro Gamma correcto: condition_ids (plural, no conditionId)
+  - Búsqueda primaria por slug (100% confiable, ya funciona en find_active_market)
+  - Validación de que el conditionId en la respuesta coincide con el pedido
+  - Fallback a condition_ids si no hay slug disponible
+  - build_market_info guarda gamma_condition_id y market_slug para resolución
 """
 
 import os
@@ -26,7 +31,6 @@ SYMBOL      = os.environ.get("SYMBOL", "SOL").upper()
 SLUG_PREFIX = "btc-updown-5m" if SYMBOL == "BTC" else "sol-updown-5m"
 MARKET_NAME = "Bitcoin" if SYMBOL == "BTC" else "Solana"
 
-# Mapa de slugs para los 3 activos
 SLUG_PREFIXES = {
     "SOL": "sol-updown-5m",
     "BTC": "btc-updown-5m",
@@ -69,23 +73,26 @@ def build_market_info(gamma_m, clob_m) -> dict | None:
     up_t   = next((t for t in tokens if "up"   in (t.get("outcome") or "").lower()), tokens[0])
     down_t = next((t for t in tokens if "down" in (t.get("outcome") or "").lower()), tokens[1])
 
+    # Guardar slug y gamma_condition_id para usarlos en fetch_market_resolution
+    slug = clob_m.get("market_slug") or gamma_m.get("slug", "")
+
     return {
-        "condition_id":     clob_m.get("condition_id"),
-        "question":         clob_m.get("question", "SOL Up/Down 5min"),
-        "end_date":         gamma_m.get("endDate") or clob_m.get("end_date_iso", ""),
-        "market_slug":      clob_m.get("market_slug", ""),
-        "accepting_orders": bool(clob_m.get("accepting_orders")),
-        "up_token_id":      up_t["token_id"],
-        "up_outcome":       up_t.get("outcome", "Up"),
-        "up_price":         float(up_t.get("price") or 0.5),
-        "down_token_id":    down_t["token_id"],
-        "down_outcome":     down_t.get("outcome", "Down"),
-        "down_price":       float(down_t.get("price") or 0.5),
+        "condition_id":       clob_m.get("condition_id"),
+        "gamma_condition_id": gamma_m.get("conditionId"),   # ← ID tal como lo conoce Gamma
+        "market_slug":        slug,                          # ← slug para buscar resolución
+        "question":           clob_m.get("question", "SOL Up/Down 5min"),
+        "end_date":           gamma_m.get("endDate") or clob_m.get("end_date_iso", ""),
+        "accepting_orders":   bool(clob_m.get("accepting_orders")),
+        "up_token_id":        up_t["token_id"],
+        "up_outcome":         up_t.get("outcome", "Up"),
+        "up_price":           float(up_t.get("price") or 0.5),
+        "down_token_id":      down_t["token_id"],
+        "down_outcome":       down_t.get("outcome", "Down"),
+        "down_price":         float(down_t.get("price") or 0.5),
     }
 
 
 def _order_book_live(token_id: str) -> bool:
-    """Check that an order book actually exists (not 404)."""
     try:
         r = requests.get(
             f"{CLOB_HOST}/book",
@@ -128,110 +135,139 @@ def find_active_market(symbol: str) -> dict | None:
     return None
 
 
-def fetch_market_resolution(condition_id: str) -> str | None:
+def _parse_gamma_resolution(market: dict) -> str | None:
+    """
+    Dado un objeto market de Gamma, intenta extraer UP o DOWN.
+    Retorna None si aún no hay resolución confirmada (precio < 0.95).
+    """
+    raw_prices   = market.get("outcomePrices")
+    raw_outcomes = market.get("outcomes")
+
+    if not raw_prices:
+        return None
+
+    try:
+        prices = [float(p) for p in _json.loads(raw_prices)] \
+                 if isinstance(raw_prices, str) else [float(p) for p in raw_prices]
+
+        outcomes = _json.loads(raw_outcomes) \
+                   if isinstance(raw_outcomes, str) else (raw_outcomes or [])
+
+        if outcomes:
+            for outcome, price in zip(outcomes, prices):
+                if price >= 0.95:
+                    label = str(outcome).strip().upper()
+                    if "UP" in label:
+                        return "UP"
+                    elif "DOWN" in label:
+                        return "DOWN"
+        else:
+            # Sin labels: convención índice 0=Up, 1=Down en mercados 5m de Polymarket
+            if prices[0] >= 0.95:
+                return "UP"
+            elif len(prices) > 1 and prices[1] >= 0.95:
+                return "DOWN"
+    except Exception:
+        pass
+
+    return None
+
+
+def fetch_market_resolution(condition_id: str, market_slug: str = "") -> str | None:
     """
     Consulta Gamma para obtener el resultado final de un mercado cerrado.
     Retorna 'UP', 'DOWN', o None si aún no está resuelto.
 
-    [DEBUG MODE ACTIVO] — imprime el payload raw de Gamma a stderr.
+    Bugs corregidos vs versión original:
+      1. El parámetro de Gamma es 'condition_ids' (plural), no 'conditionId'.
+         Con 'conditionId' Gamma ignora el filtro y retorna mercados random.
+      2. La búsqueda por slug es más confiable — es el mismo mecanismo
+         que usa find_active_market y nunca falla en discovery.
+      3. Se valida que el conditionId de la respuesta coincida con el pedido.
     """
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"conditionId": condition_id},
-            timeout=8,
-        )
-        r.raise_for_status()
-        data = r.json()
 
-        market = data[0] if isinstance(data, list) and data else data
-        if not market:
-            print(f"[DEBUG GAMMA] condition_id={condition_id[:12]}... → respuesta vacía", file=sys.stderr, flush=True)
-            return None
+    # ── MÉTODO 1: por slug (más confiable) ───────────────────────────────────
+    if market_slug:
+        try:
+            r = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"slug": market_slug},
+                timeout=8,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                market = data[0]
+                # Validar que el slug coincide exactamente
+                if market.get("slug", "").lower() == market_slug.lower():
+                    result = _parse_gamma_resolution(market)
+                    if result:
+                        print(
+                            f"[GAMMA OK] slug={market_slug} → {result} "
+                            f"prices={market.get('outcomePrices')}",
+                            file=sys.stderr, flush=True,
+                        )
+                        return result
+                    # Mercado correcto pero aún sin resolver
+                    print(
+                        f"[GAMMA WAIT] slug={market_slug} | "
+                        f"closed={market.get('closed')} | prices={market.get('outcomePrices')}",
+                        file=sys.stderr, flush=True,
+                    )
+                    return None
+        except Exception as e:
+            print(f"[GAMMA ERR] slug lookup falló: {e}", file=sys.stderr, flush=True)
 
-        # ══════════════════════════════════════════════
-        #  DEBUG: dump completo del payload de Gamma
-        # ══════════════════════════════════════════════
-        debug_fields = {
-            "conditionId":    market.get("conditionId", "")[:12] + "...",
-            "slug":           market.get("slug", ""),
-            "closed":         market.get("closed"),
-            "active":         market.get("active"),
-            "resolved":       market.get("resolved"),
-            "resolutionTime": market.get("resolutionTime"),
-            "outcomePrices":  market.get("outcomePrices"),
-            "outcomes":       market.get("outcomes"),
-            "winnerOutcome":  market.get("winnerOutcome"),
-            "resolvedBy":     market.get("resolvedBy"),
-            # dump de TODAS las keys para no perderse nada
-            "ALL_KEYS":       list(market.keys()),
-        }
-        print(
-            f"\n[DEBUG GAMMA] ── condition_id={condition_id[:12]}...\n"
-            + _json.dumps(debug_fields, indent=2, ensure_ascii=False),
-            file=sys.stderr,
-            flush=True,
-        )
-        # ══════════════════════════════════════════════
+    # ── MÉTODO 2: por condition_ids (parámetro plural correcto) ──────────────
+    if condition_id:
+        try:
+            r = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"condition_ids": condition_id},
+                timeout=8,
+            )
+            r.raise_for_status()
+            data = r.json()
 
-        # --- Intento 1: campo winnerOutcome (algunos mercados lo tienen directo)
-        winner = market.get("winnerOutcome")
-        if winner:
-            label = str(winner).strip().upper()
-            if "UP" in label:
-                print(f"[DEBUG GAMMA] → resuelto via winnerOutcome: UP", file=sys.stderr, flush=True)
-                return "UP"
-            elif "DOWN" in label:
-                print(f"[DEBUG GAMMA] → resuelto via winnerOutcome: DOWN", file=sys.stderr, flush=True)
-                return "DOWN"
+            # Buscar el market que realmente coincide — NO asumir data[0]
+            # Gamma puede retornar varios resultados o un mercado incorrecto
+            market = None
+            if isinstance(data, list):
+                market = next(
+                    (m for m in data
+                     if (m.get("conditionId") or "").lower() == condition_id.lower()),
+                    None,
+                )
+            elif isinstance(data, dict):
+                if (data.get("conditionId") or "").lower() == condition_id.lower():
+                    market = data
 
-        # --- Intento 2: outcomePrices (campo original)
-        raw_prices   = market.get("outcomePrices")
-        raw_outcomes = market.get("outcomes")
+            if market:
+                result = _parse_gamma_resolution(market)
+                if result:
+                    print(
+                        f"[GAMMA OK] cid={condition_id[:12]}... → {result} "
+                        f"prices={market.get('outcomePrices')}",
+                        file=sys.stderr, flush=True,
+                    )
+                    return result
+                print(
+                    f"[GAMMA WAIT] cid={condition_id[:12]}... | "
+                    f"closed={market.get('closed')} | prices={market.get('outcomePrices')}",
+                    file=sys.stderr, flush=True,
+                )
+                return None
+            else:
+                print(
+                    f"[GAMMA MISS] cid={condition_id[:12]}... no encontrado "
+                    f"en {len(data) if isinstance(data, list) else 1} resultados. "
+                    f"Verificar que el condition_id es correcto.",
+                    file=sys.stderr, flush=True,
+                )
+        except Exception as e:
+            print(f"[GAMMA ERR] condition_ids lookup falló: {e}", file=sys.stderr, flush=True)
 
-        if raw_prices:
-            try:
-                if isinstance(raw_prices, str):
-                    prices = [float(p) for p in _json.loads(raw_prices)]
-                else:
-                    prices = [float(p) for p in raw_prices]
-
-                print(f"[DEBUG GAMMA] → prices parseados: {prices}", file=sys.stderr, flush=True)
-
-                if raw_outcomes:
-                    if isinstance(raw_outcomes, str):
-                        outcomes = _json.loads(raw_outcomes)
-                    else:
-                        outcomes = raw_outcomes
-
-                    print(f"[DEBUG GAMMA] → outcomes parseados: {outcomes}", file=sys.stderr, flush=True)
-
-                    for outcome, price in zip(outcomes, prices):
-                        if price >= 0.95:   # bajamos de 0.99 a 0.95 por seguridad
-                            label = str(outcome).strip().upper()
-                            print(f"[DEBUG GAMMA] → winner por precio: outcome={outcome} price={price}", file=sys.stderr, flush=True)
-                            if "UP" in label:
-                                return "UP"
-                            elif "DOWN" in label:
-                                return "DOWN"
-                else:
-                    # Sin outcomes labels — asumir índice 0=UP, 1=DOWN
-                    if prices[0] >= 0.95:
-                        print(f"[DEBUG GAMMA] → winner por índice 0 (UP): price={prices[0]}", file=sys.stderr, flush=True)
-                        return "UP"
-                    elif len(prices) > 1 and prices[1] >= 0.95:
-                        print(f"[DEBUG GAMMA] → winner por índice 1 (DOWN): price={prices[1]}", file=sys.stderr, flush=True)
-                        return "DOWN"
-
-            except Exception as e:
-                print(f"[DEBUG GAMMA] → error parseando outcomePrices: {e}", file=sys.stderr, flush=True)
-
-        print(f"[DEBUG GAMMA] → sin resolución detectada (None)", file=sys.stderr, flush=True)
-        return None
-
-    except Exception as e:
-        print(f"[DEBUG GAMMA] → excepción: {e}", file=sys.stderr, flush=True)
-        return None
+    return None
 
 
 def find_active_btc_market() -> dict | None:
