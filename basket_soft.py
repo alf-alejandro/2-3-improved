@@ -206,43 +206,49 @@ def _move_to_pending(pos: dict):
     log_event(f"PENDING {sym} ({pos['side']}) — esperando resolución de Gamma (condition_id={condition_id[:8]}...)")
 
 
-def check_pending_resolutions():
-    """Consulta Gamma para cada posición pendiente. Cuando responde, registra el resultado real."""
-    if not bt["pending_positions"]:
-        return
+async def pending_resolution_loop():
+    """
+    Loop independiente que corre en paralelo al main_loop.
+    Consulta Gamma cada GAMMA_POLL_INTERVAL segundos para resolver pendientes
+    sin bloquear el trading normal.
+    """
+    while True:
+        await asyncio.sleep(GAMMA_POLL_INTERVAL)
+        if not bt["pending_positions"]:
+            continue
 
-    resueltas = []
-    for pos in bt["pending_positions"]:
-        sym          = pos["asset"]
-        condition_id = pos["condition_id"]
-        elapsed      = time.time() - pos["pending_since"]
-        pos["gamma_polls"] += 1
+        resueltas = []
+        for pos in list(bt["pending_positions"]):
+            sym          = pos["asset"]
+            condition_id = pos["condition_id"]
+            elapsed      = time.time() - pos["pending_since"]
+            pos["gamma_polls"] += 1
 
-        resolved = fetch_market_resolution(condition_id)
+            resolved = fetch_market_resolution(condition_id)
 
-        if resolved in ("UP", "DOWN"):
-            log_event(f"GAMMA {sym}: resuelto → {resolved} (después de {elapsed:.0f}s, {pos['gamma_polls']} polls)")
-            _apply_resolution(pos, resolved)
-            resueltas.append(pos)
+            if resolved in ("UP", "DOWN"):
+                log_event(f"GAMMA {sym}: resuelto → {resolved} (después de {elapsed:.0f}s, {pos['gamma_polls']} polls)")
+                _apply_resolution(pos, resolved)
+                resueltas.append(pos)
 
-        elif elapsed > GAMMA_TIMEOUT_SECS:
-            log_event(f"GAMMA {sym}: timeout {GAMMA_TIMEOUT_SECS}s sin respuesta — LOSS conservador")
-            pnl = -ENTRY_USD
-            bt["capital"]   += ENTRY_USD + pnl
-            bt["total_pnl"] += pnl
-            bt["losses"]    += 1
-            update_drawdown()
-            _record_trade(pos, "TIMEOUT", "LOSS", pnl)
-            resueltas.append(pos)
+            elif elapsed > GAMMA_TIMEOUT_SECS:
+                log_event(f"GAMMA {sym}: timeout {GAMMA_TIMEOUT_SECS}s sin respuesta — LOSS conservador")
+                pnl = -ENTRY_USD
+                bt["capital"]   += ENTRY_USD + pnl
+                bt["total_pnl"] += pnl
+                bt["losses"]    += 1
+                update_drawdown()
+                _record_trade(pos, "TIMEOUT", "LOSS", pnl)
+                resueltas.append(pos)
 
-        else:
-            log_event(f"GAMMA {sym}: sin resolución aún ({elapsed:.0f}s esperando...)")
+            else:
+                log_event(f"GAMMA {sym}: sin resolución aún ({elapsed:.0f}s esperando...)")
 
-    for pos in resueltas:
-        bt["pending_positions"].remove(pos)
+        for pos in resueltas:
+            bt["pending_positions"].remove(pos)
 
-    if resueltas:
-        write_state()
+        if resueltas:
+            write_state()
 
 
 # ═══════════════════════════════════════════════════════
@@ -796,9 +802,6 @@ async def main_loop():
                     await asyncio.sleep(chunk)
                     slept += chunk
                     bt["next_wake"] = f"{wake_at} (en {int(max(0, sleep_duration - slept))}s)"
-                    # Revisar pendientes incluso mientras duerme
-                    if bt["pending_positions"]:
-                        check_pending_resolutions()
                     write_state()
 
                 bt["phase"] = "ACTIVO"
@@ -822,20 +825,13 @@ async def main_loop():
             if bt["positions"]:
                 check_resolution()
 
-            # Revisar pendientes SIEMPRE — antes de cualquier continue
-            if bt["pending_positions"]:
-                check_pending_resolutions()
-
             if all(markets[s]["info"] is None for s in SYMBOLS):
                 if bt["positions"]:
                     log_event("Mercado expirado con posiciones abiertas — moviendo a pendientes...")
                     check_resolution()
-                # Solo avanzar al siguiente ciclo si no hay nada pendiente
-                if not bt["positions"] and not bt["pending_positions"]:
+                if not bt["positions"]:
                     log_event("Ciclo expirado — buscando nuevo ciclo...")
                     await discover_all()
-                else:
-                    await asyncio.sleep(GAMMA_POLL_INTERVAL)
                 continue
 
             if not bt["positions"]:
@@ -882,7 +878,10 @@ if __name__ == "__main__":
     t.start()
 
     try:
-        asyncio.run(main_loop())
+        asyncio.run(asyncio.gather(
+            main_loop(),
+            pending_resolution_loop(),
+        ))
     except KeyboardInterrupt:
         log.info("Basket detenido.")
         total = bt["wins"] + bt["losses"]
