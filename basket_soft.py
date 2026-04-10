@@ -187,10 +187,15 @@ GAMMA_TIMEOUT_SECS   = 600   # 10 min máximo esperando Gamma antes de abandonar
 
 def _move_to_pending(pos: dict):
     """Mueve una posición a pending — el resultado se sabrá cuando Gamma resuelva."""
-    sym = pos["asset"]
-    condition_id = (pos.get("market_info_snapshot") or {}).get("condition_id")
-    if not condition_id:
-        log_event(f"PENDING {sym}: sin condition_id — no se puede consultar Gamma. LOSS conservador.")
+    sym      = pos["asset"]
+    snapshot = pos.get("market_info_snapshot") or {}
+
+    # Usar gamma_condition_id si está disponible, sino el condition_id del CLOB
+    condition_id = snapshot.get("gamma_condition_id") or snapshot.get("condition_id")
+    market_slug  = snapshot.get("market_slug", "")
+
+    if not condition_id and not market_slug:
+        log_event(f"PENDING {sym}: sin condition_id ni slug — no se puede consultar Gamma. LOSS conservador.")
         pnl = -ENTRY_USD
         bt["capital"]   += ENTRY_USD + pnl
         bt["total_pnl"] += pnl
@@ -199,11 +204,15 @@ def _move_to_pending(pos: dict):
         _record_trade(pos, "UNKNOWN", "LOSS", pnl, source="UNKNOWN")
         return
 
-    pos["pending_since"] = time.time()
-    pos["condition_id"]  = condition_id
-    pos["gamma_polls"]   = 0
+    pos["pending_since"]  = time.time()
+    pos["condition_id"]   = condition_id
+    pos["market_slug"]    = market_slug
+    pos["gamma_polls"]    = 0
     bt["pending_positions"].append(pos)
-    log_event(f"PENDING {sym} ({pos['side']}) — esperando resolución de Gamma (condition_id={condition_id[:8]}...)")
+    log_event(
+        f"PENDING {sym} ({pos['side']}) — esperando Gamma "
+        f"slug={market_slug or 'N/A'} cid={str(condition_id or '')[:8]}..."
+    )
 
 
 async def pending_resolution_loop():
@@ -224,7 +233,10 @@ async def pending_resolution_loop():
             elapsed      = time.time() - pos["pending_since"]
             pos["gamma_polls"] += 1
 
-            resolved = fetch_market_resolution(condition_id)
+            resolved = fetch_market_resolution(
+                condition_id,
+                market_slug=pos.get("market_slug", ""),
+            )
 
             if resolved in ("UP", "DOWN"):
                 log_event(f"GAMMA {sym}: resuelto → {resolved} (después de {elapsed:.0f}s, {pos['gamma_polls']} polls)")
@@ -530,7 +542,11 @@ def _build_single_position(sym: str, side: str, secs: float,
         },
         "capital_before":  capital_before,
         "market_info_snapshot": {
-            "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
+            # condition_id del CLOB (puede diferir en formato del de Gamma)
+            "condition_id":       markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
+            # gamma_condition_id y slug son los identificadores correctos para fetch_market_resolution
+            "gamma_condition_id": markets[sym]["info"].get("gamma_condition_id") if markets[sym]["info"] else None,
+            "market_slug":        markets[sym]["info"].get("market_slug", "") if markets[sym]["info"] else "",
         },
     }
 
