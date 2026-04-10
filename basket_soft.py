@@ -182,8 +182,8 @@ def update_drawdown():
 #  RESOLUCIÓN VÍA GAMMA (resultado real)
 # ═══════════════════════════════════════════════════════
 
-GAMMA_POLL_INTERVAL  = 5.0   # segundos entre consultas a Gamma
-GAMMA_TIMEOUT_SECS   = 600   # 10 min máximo esperando Gamma antes de abandonar
+GAMMA_POLL_INTERVAL  = 3.0   # segundos entre polls (CLOB es la fuente primaria)
+GAMMA_TIMEOUT_SECS   = 600   # 10 min máximo antes de abandonar con LOSS
 
 def _move_to_pending(pos: dict):
     """Mueve una posición a pending — el resultado se sabrá cuando Gamma resuelva."""
@@ -215,11 +215,93 @@ def _move_to_pending(pos: dict):
     )
 
 
+def _get_last_trade_price(token_id: str) -> float | None:
+    """
+    Consulta el último precio de trade del CLOB para un token.
+    Cuando un mercado resuelve, el último trade del token ganador es 1.0 (o muy cercano).
+    Endpoint: GET /last-trade-price?token_id=...
+    """
+    try:
+        r = requests.get(
+            f"{CLOB_HOST}/last-trade-price",
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            price = data.get("price")
+            if price is not None:
+                return float(price)
+    except Exception:
+        pass
+    return None
+
+
+async def _check_clob_resolution(pos: dict) -> str | None:
+    """
+    Detecta resolución directamente vía CLOB sin depender de Gamma.
+    Gamma tiene lag de varios minutos — el CLOB refleja el estado on-chain inmediatamente.
+
+    Estrategia en 2 pasos:
+      1. last-trade-price: cuando un token gana, su último trade es >= 0.98
+      2. order book: bid >= 0.98 sin asks = token resuelto en 1.0
+    """
+    snap     = pos.get("market_info_snapshot") or {}
+    side     = pos["side"]
+    up_tid   = snap.get("up_token_id")
+    down_tid = snap.get("down_token_id")
+
+    if not up_tid or not down_tid:
+        return None
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        # ── Paso 1: last-trade-price (señal más directa de resolución) ────────
+        up_last, dn_last = await asyncio.gather(
+            loop.run_in_executor(None, _get_last_trade_price, up_tid),
+            loop.run_in_executor(None, _get_last_trade_price, down_tid),
+        )
+
+        if up_last is not None and up_last >= 0.95:
+            return "UP"
+        if dn_last is not None and dn_last >= 0.95:
+            return "DOWN"
+
+        # ── Paso 2: order book (fallback si last-trade no está disponible) ────
+        up_metrics, _ = await loop.run_in_executor(None, get_order_book_metrics, up_tid)
+        dn_metrics, _ = await loop.run_in_executor(None, get_order_book_metrics, down_tid)
+
+        if up_metrics:
+            bid = up_metrics["best_bid"]
+            ask = up_metrics["best_ask"]
+            n_asks = up_metrics["num_asks"]
+            # Resuelto UP: bid alto sin asks, o book completamente vacío con last-trade alto
+            if bid >= 0.95 and (n_asks == 0 or ask >= 0.99):
+                return "UP"
+
+        if dn_metrics:
+            bid = dn_metrics["best_bid"]
+            ask = dn_metrics["best_ask"]
+            n_asks = dn_metrics["num_asks"]
+            if bid >= 0.95 and (n_asks == 0 or ask >= 0.99):
+                return "DOWN"
+
+    except Exception:
+        pass
+
+    return None
+
+
 async def pending_resolution_loop():
     """
     Loop independiente que corre en paralelo al main_loop.
-    Consulta Gamma cada GAMMA_POLL_INTERVAL segundos para resolver pendientes
-    sin bloquear el trading normal.
+
+    Fuente primaria: CLOB directo (last-trade-price + order book).
+      → Refleja resolución on-chain inmediatamente, igual que la UI de Polymarket.
+      → Gamma tiene lag de minutos y bugs conocidos con closed/outcomePrices.
+
+    Fuente secundaria: Gamma API (solo como fallback adicional).
     """
     while True:
         await asyncio.sleep(GAMMA_POLL_INTERVAL)
@@ -229,22 +311,30 @@ async def pending_resolution_loop():
         resueltas = []
         for pos in list(bt["pending_positions"]):
             sym          = pos["asset"]
-            condition_id = pos["condition_id"]
+            condition_id = pos.get("condition_id", "")
             elapsed      = time.time() - pos["pending_since"]
             pos["gamma_polls"] += 1
 
+            # ── Fuente 1: CLOB (last-trade-price + order book) ───────────────
+            resolved = await _check_clob_resolution(pos)
+            if resolved in ("UP", "DOWN"):
+                log_event(f"RESOLUCION CLOB {sym}: → {resolved} ({elapsed:.0f}s)")
+                _apply_resolution(pos, resolved, source="CLOB_PENDING")
+                resueltas.append(pos)
+                continue
+
+            # ── Fuente 2: Gamma (fallback — lag conocido de varios minutos) ──
             resolved = fetch_market_resolution(
                 condition_id,
                 market_slug=pos.get("market_slug", ""),
             )
-
             if resolved in ("UP", "DOWN"):
-                log_event(f"GAMMA {sym}: resuelto → {resolved} (después de {elapsed:.0f}s, {pos['gamma_polls']} polls)")
+                log_event(f"RESOLUCION GAMMA {sym}: → {resolved} ({elapsed:.0f}s, {pos['gamma_polls']} polls)")
                 _apply_resolution(pos, resolved, source="GAMMA")
                 resueltas.append(pos)
 
             elif elapsed > GAMMA_TIMEOUT_SECS:
-                log_event(f"GAMMA {sym}: timeout {GAMMA_TIMEOUT_SECS}s sin respuesta — LOSS conservador")
+                log_event(f"TIMEOUT {sym}: {GAMMA_TIMEOUT_SECS}s sin respuesta CLOB ni Gamma — LOSS conservador")
                 pnl = -ENTRY_USD
                 bt["capital"]   += ENTRY_USD + pnl
                 bt["total_pnl"] += pnl
@@ -254,7 +344,7 @@ async def pending_resolution_loop():
                 resueltas.append(pos)
 
             else:
-                log_event(f"GAMMA {sym}: sin resolución aún ({elapsed:.0f}s esperando...)")
+                log_event(f"PENDING {sym}: esperando CLOB/Gamma ({elapsed:.0f}s / {GAMMA_TIMEOUT_SECS}s máx)")
 
         for pos in resueltas:
             bt["pending_positions"].remove(pos)
@@ -542,11 +632,12 @@ def _build_single_position(sym: str, side: str, secs: float,
         },
         "capital_before":  capital_before,
         "market_info_snapshot": {
-            # condition_id del CLOB (puede diferir en formato del de Gamma)
             "condition_id":       markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
-            # gamma_condition_id y slug son los identificadores correctos para fetch_market_resolution
             "gamma_condition_id": markets[sym]["info"].get("gamma_condition_id") if markets[sym]["info"] else None,
             "market_slug":        markets[sym]["info"].get("market_slug", "") if markets[sym]["info"] else "",
+            # Token IDs para verificar resolución directamente en el CLOB (más rápido que Gamma)
+            "up_token_id":        markets[sym]["info"].get("up_token_id") if markets[sym]["info"] else None,
+            "down_token_id":      markets[sym]["info"].get("down_token_id") if markets[sym]["info"] else None,
         },
     }
 
