@@ -796,6 +796,9 @@ async def main_loop():
                     await asyncio.sleep(chunk)
                     slept += chunk
                     bt["next_wake"] = f"{wake_at} (en {int(max(0, sleep_duration - slept))}s)"
+                    # Revisar pendientes incluso mientras duerme
+                    if bt["pending_positions"]:
+                        check_pending_resolutions()
                     write_state()
 
                 bt["phase"] = "ACTIVO"
@@ -819,7 +822,7 @@ async def main_loop():
             if bt["positions"]:
                 check_resolution()
 
-            # Revisar posiciones esperando Gamma (resultado real)
+            # Revisar pendientes SIEMPRE — antes de cualquier continue
             if bt["pending_positions"]:
                 check_pending_resolutions()
 
@@ -827,9 +830,12 @@ async def main_loop():
                 if bt["positions"]:
                     log_event("Mercado expirado con posiciones abiertas — moviendo a pendientes...")
                     check_resolution()
+                # Solo avanzar al siguiente ciclo si no hay nada pendiente
                 if not bt["positions"] and not bt["pending_positions"]:
                     log_event("Ciclo expirado — buscando nuevo ciclo...")
                     await discover_all()
+                else:
+                    await asyncio.sleep(GAMMA_POLL_INTERVAL)
                 continue
 
             if not bt["positions"]:
