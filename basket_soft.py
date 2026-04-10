@@ -7,11 +7,14 @@ LOGICA BINARIA CORRECTA:
   Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
   Shares comprados = $1.00 / precio_ask
 
-v6: Entrada en los 3 activos simultáneamente cuando se detecta el armónico.
-  - bt["position"] → bt["positions"] (lista de hasta 3 posiciones)
-  - Capital descontado = ENTRY_USD * 3 por ciclo
-  - Side de cada activo: el que tenga mayor divergencia (señal global) aplica
-    a todos. Cada activo entra por el side del armónico detectado.
+v7: Modo armónico 2/3
+  - Detecta cuando 2 activos se alinean con la media armónica y 1 va al lado
+    contrario (rezagado). En ese caso:
+      · Los 2 alineados entran por el side del armónico global.
+      · El rezagado entra por el side CONTRARIO (apuesta de convergencia).
+      · Si el rezagado no cumple ENTRY_MIN_PRICE, se entran solo los 2.
+  - bt["signal_mode"] → "3/3" (original) o "2/3" (nuevo)
+  - ENTRY_CLOSE_SECS bajado de 30 a 20 (+10 s de ventana)
 """
 
 import asyncio
@@ -48,11 +51,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 POLL_INTERVAL        = 0.5
 DIVERGENCE_THRESHOLD = 0.05
 DIVERGENCE_MAX       = 0.14
+# Umbral mínimo de divergencia inversa para considerar un activo como
+# "rezagado opuesto" en el modo 2/3. Si su mid supera la media armónica
+# del side global en más de este valor, se clasifica como rezagado.
+DIVERGENCE_23_LAG    = 0.03
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 60
-ENTRY_CLOSE_SECS     = 30
-RESOLUTION_MAX_SECS  = 7   # solo chequear resolucion cuando queden <= 7s
+ENTRY_CLOSE_SECS     = 20   # era 30 → +10 s de ventana (ahora cierra a 20 s del fin)
+RESOLUTION_MAX_SECS  = 7
 
 CAPITAL_TOTAL        = 100.0
 ENTRY_PCT            = 0.01
@@ -65,7 +72,7 @@ CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
 ENTRY_MIN_PRICE      = 0.65
-MID_HISTORY_SIZE     = 10   # 5 segundos a 0.5s de poll → resolución confirmada
+MID_HISTORY_SIZE     = 10
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
@@ -97,9 +104,11 @@ bt = {
     "signal_asset": None,
     "signal_side":  None,
     "signal_div":   0.0,
+    "signal_mode":  "NONE",   # "3/3" | "2/3" | "NONE"
+    "signal_sides": {},       # {sym: side} — lado individual por activo (modo 2/3)
     "entry_window": False,
-    "positions":    [],          # ← LISTA de posiciones (máx 3)
-    "pending_positions": [],     # ← posiciones esperando resolución de Gamma
+    "positions":    [],
+    "pending_positions": [],
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -119,7 +128,7 @@ recent_events = deque(maxlen=50)
 
 CSV_COLUMNS = [
     "trade_id", "entry_ts", "exit_ts", "duration_s",
-    "asset", "side", "consensus",
+    "asset", "side", "consensus", "signal_mode",
     "entry_ask", "entry_bid", "entry_mid", "entry_usd", "shares",
     "secs_left_entry", "harm_entry", "gap_pts",
     "peer1_sym", "peer1_side_mid", "peer1_opp_mid",
@@ -179,22 +188,20 @@ def update_drawdown():
 
 
 # ═══════════════════════════════════════════════════════
-#  RESOLUCIÓN VÍA GAMMA (resultado real)
+#  RESOLUCIÓN VÍA CLOB
 # ═══════════════════════════════════════════════════════
 
-GAMMA_POLL_INTERVAL  = 3.0   # segundos entre polls del CLOB
+GAMMA_POLL_INTERVAL  = 3.0
+
 
 def _move_to_pending(pos: dict):
-    """Mueve una posición a pending — el resultado se sabrá cuando Gamma resuelva."""
     sym      = pos["asset"]
     snapshot = pos.get("market_info_snapshot") or {}
-
-    # Usar gamma_condition_id si está disponible, sino el condition_id del CLOB
     condition_id = snapshot.get("gamma_condition_id") or snapshot.get("condition_id")
     market_slug  = snapshot.get("market_slug", "")
 
     if not condition_id and not market_slug:
-        log_event(f"PENDING {sym}: sin condition_id ni slug — no se puede consultar Gamma. LOSS conservador.")
+        log_event(f"PENDING {sym}: sin condition_id ni slug — LOSS conservador.")
         pnl = -ENTRY_USD
         bt["capital"]   += ENTRY_USD + pnl
         bt["total_pnl"] += pnl
@@ -209,17 +216,12 @@ def _move_to_pending(pos: dict):
     pos["gamma_polls"]    = 0
     bt["pending_positions"].append(pos)
     log_event(
-        f"PENDING {sym} ({pos['side']}) — esperando Gamma "
+        f"PENDING {sym} ({pos['side']}) — esperando CLOB "
         f"slug={market_slug or 'N/A'} cid={str(condition_id or '')[:8]}..."
     )
 
 
 def _get_last_trade_price(token_id: str) -> float | None:
-    """
-    Consulta el último precio de trade del CLOB para un token.
-    Cuando un mercado resuelve, el último trade del token ganador es 1.0 (o muy cercano).
-    Endpoint: GET /last-trade-price?token_id=...
-    """
     try:
         r = requests.get(
             f"{CLOB_HOST}/last-trade-price",
@@ -237,16 +239,7 @@ def _get_last_trade_price(token_id: str) -> float | None:
 
 
 async def _check_clob_resolution(pos: dict) -> str | None:
-    """
-    Detecta resolución directamente vía CLOB sin depender de Gamma.
-    Gamma tiene lag de varios minutos — el CLOB refleja el estado on-chain inmediatamente.
-
-    Estrategia en 2 pasos:
-      1. last-trade-price: cuando un token gana, su último trade es >= 0.98
-      2. order book: bid >= 0.98 sin asks = token resuelto en 1.0
-    """
     snap     = pos.get("market_info_snapshot") or {}
-    side     = pos["side"]
     up_tid   = snap.get("up_token_id")
     down_tid = snap.get("down_token_id")
 
@@ -256,7 +249,6 @@ async def _check_clob_resolution(pos: dict) -> str | None:
     loop = asyncio.get_event_loop()
 
     try:
-        # ── Paso 1: last-trade-price (señal más directa de resolución) ────────
         up_last, dn_last = await asyncio.gather(
             loop.run_in_executor(None, _get_last_trade_price, up_tid),
             loop.run_in_executor(None, _get_last_trade_price, down_tid),
@@ -267,7 +259,6 @@ async def _check_clob_resolution(pos: dict) -> str | None:
         if dn_last is not None and dn_last >= 0.95:
             return "DOWN"
 
-        # ── Paso 2: order book (fallback si last-trade no está disponible) ────
         up_metrics, _ = await loop.run_in_executor(None, get_order_book_metrics, up_tid)
         dn_metrics, _ = await loop.run_in_executor(None, get_order_book_metrics, down_tid)
 
@@ -275,7 +266,6 @@ async def _check_clob_resolution(pos: dict) -> str | None:
             bid = up_metrics["best_bid"]
             ask = up_metrics["best_ask"]
             n_asks = up_metrics["num_asks"]
-            # Resuelto UP: bid alto sin asks, o book completamente vacío con last-trade alto
             if bid >= 0.95 and (n_asks == 0 or ask >= 0.99):
                 return "UP"
 
@@ -293,13 +283,6 @@ async def _check_clob_resolution(pos: dict) -> str | None:
 
 
 async def pending_resolution_loop():
-    """
-    Loop independiente que corre en paralelo al main_loop.
-
-    Usa CLOB directo (last-trade-price + order book) como unica fuente.
-    Si el CLOB no detecta resolucion en el primer poll -> LOSS conservador.
-    Gamma fue eliminado: tiene lag de minutos y bugs conocidos.
-    """
     while True:
         await asyncio.sleep(GAMMA_POLL_INTERVAL)
         if not bt["pending_positions"]:
@@ -307,9 +290,8 @@ async def pending_resolution_loop():
 
         resueltas = []
         for pos in list(bt["pending_positions"]):
-            sym          = pos["asset"]
-            elapsed      = time.time() - pos["pending_since"]
-            # ── Fuente 1: CLOB (last-trade-price + order book) ───────────────
+            sym     = pos["asset"]
+            elapsed = time.time() - pos["pending_since"]
             resolved = await _check_clob_resolution(pos)
             if resolved in ("UP", "DOWN"):
                 log_event(f"RESOLUCION CLOB {sym}: → {resolved} ({elapsed:.0f}s)")
@@ -317,7 +299,6 @@ async def pending_resolution_loop():
                 resueltas.append(pos)
                 continue
 
-            # CLOB no detecto resolucion -> LOSS conservador inmediato
             log_event(f"LOSS CONSERVADOR {sym}: CLOB sin resolucion -> anotando perdida")
             pnl = -ENTRY_USD
             bt["capital"]   += ENTRY_USD + pnl
@@ -335,7 +316,7 @@ async def pending_resolution_loop():
 
 
 # ═══════════════════════════════════════════════════════
-#  ESCRITURA DE ESTADO PARA DASHBOARD
+#  ESCRITURA DE ESTADO
 # ═══════════════════════════════════════════════════════
 
 def write_state():
@@ -364,7 +345,9 @@ def write_state():
         "signal_asset": bt["signal_asset"],
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
-        "positions": bt["positions"],          # ← lista completa
+        "signal_mode": bt["signal_mode"],
+        "signal_sides": bt["signal_sides"],
+        "positions": bt["positions"],
         "pending_resolution": None,
         "markets": {
             sym: {
@@ -502,27 +485,47 @@ async def fetch_all():
 
 
 # ═══════════════════════════════════════════════════════
-#  SEÑALES Y LÓGICA DE TRADING
+#  SEÑALES Y DETECCIÓN DE MODO ARMÓNICO
 # ═══════════════════════════════════════════════════════
 
+def _classify_assets_23(mids: dict, harm: float) -> tuple[list, str | None]:
+    """
+    Dada la media armónica y los mids de los 3 activos, determina si estamos
+    en modo 2/3: exactamente 2 activos por debajo del armónico (alineados) y
+    1 por encima del armónico en al menos DIVERGENCE_23_LAG (rezagado opuesto).
+
+    Retorna (aligned_syms, laggard_sym) o ([], None) si no es modo 2/3.
+
+    "Alineado" = mid < harm  (activo barato respecto al armónico → señal de compra UP)
+    "Rezagado" = mid > harm + DIVERGENCE_23_LAG  (activo caro → va al lado contrario)
+    """
+    if harm <= 0 or len(mids) < 3:
+        return [], None
+
+    aligned  = [s for s, v in mids.items() if v < harm]
+    laggards = [s for s, v in mids.items() if v > harm + DIVERGENCE_23_LAG]
+
+    if len(aligned) == 2 and len(laggards) == 1:
+        return aligned, laggards[0]
+
+    return [], None
+
+
 def compute_signals():
-    def normalized_up(s):
-        # Usar precio real — NO clampear 0.98 a 1.0.
-        # Clampearlo aplana la harmonica y destruye la divergencia armonica
-        # cuando un activo esta en 0.98/0.99 pero sin confirmar resolucion.
+    def get_mid_up(s):
         mid = markets[s]["up_mid"]
-        if mid <= 0:
-            return 0.0
-        return mid
+        return mid if mid > 0 else 0.0
 
-    def normalized_dn(s):
+    def get_mid_dn(s):
         mid = markets[s]["dn_mid"]
-        if mid <= 0:
-            return 0.0
-        return mid
+        return mid if mid > 0 else 0.0
 
-    up_mids = {s: normalized_up(s) for s in SYMBOLS if markets[s]["up_mid"] > 0}
-    dn_mids = {s: normalized_dn(s) for s in SYMBOLS if markets[s]["dn_mid"] > 0}
+    up_mids = {s: get_mid_up(s) for s in SYMBOLS if markets[s]["up_mid"] > 0}
+    dn_mids = {s: get_mid_dn(s) for s in SYMBOLS if markets[s]["dn_mid"] > 0}
+
+    # Resetear modo
+    bt["signal_mode"]  = "NONE"
+    bt["signal_sides"] = {}
 
     if len(up_mids) < 2:
         bt["signal_asset"] = None
@@ -533,41 +536,79 @@ def compute_signals():
     bt["harm_up"] = harm_up
     bt["harm_dn"] = harm_dn
 
-    cheapest_up, div_up = find_cheapest(up_mids, harm_up)
-    cheapest_dn, div_dn = find_cheapest(dn_mids, harm_dn)
+    # ── Señal global (activo más barato) ─────────────────────────────────────
+    cheapest_up, div_up = _find_cheapest(up_mids, harm_up)
+    cheapest_dn, div_dn = _find_cheapest(dn_mids, harm_dn)
 
     if abs(div_up) >= abs(div_dn) and cheapest_up:
         bt["signal_asset"] = cheapest_up
         bt["signal_side"]  = "UP"
         bt["signal_div"]   = div_up
+        global_side        = "UP"
+        active_mids        = up_mids
+        harm_active        = harm_up
     elif cheapest_dn:
         bt["signal_asset"] = cheapest_dn
         bt["signal_side"]  = "DOWN"
         bt["signal_div"]   = div_dn
+        global_side        = "DOWN"
+        active_mids        = dn_mids
+        harm_active        = harm_dn
     else:
         bt["signal_asset"] = None
+        return
 
-    if bt["signal_asset"] and bt["signal_side"]:
-        peers = [s for s in SYMBOLS if s != bt["signal_asset"]]
-        if bt["signal_side"] == "UP":
-            peer_vals = [markets[p]["up_mid"] for p in peers if markets[p]["up_mid"] > 0]
-        else:
-            peer_vals = [markets[p]["dn_mid"] for p in peers if markets[p]["dn_mid"] > 0]
+    # ── Consenso (para modo 3/3) ──────────────────────────────────────────────
+    peers = [s for s in SYMBOLS if s != bt["signal_asset"]]
+    if global_side == "UP":
+        peer_vals = [markets[p]["up_mid"] for p in peers if markets[p]["up_mid"] > 0]
+    else:
+        peer_vals = [markets[p]["dn_mid"] for p in peers if markets[p]["dn_mid"] > 0]
 
-        if len(peer_vals) == 2 and all(v > CONSENSUS_FULL for v in peer_vals):
-            bt["consensus"] = "FULL"
-        elif len(peer_vals) >= 1 and sum(1 for v in peer_vals if v > CONSENSUS_SOFT) >= 1:
-            bt["consensus"] = "SOFT"
-        else:
-            bt["consensus"] = "NONE"
+    if len(peer_vals) == 2 and all(v > CONSENSUS_FULL for v in peer_vals):
+        bt["consensus"] = "FULL"
+    elif len(peer_vals) >= 1 and sum(1 for v in peer_vals if v > CONSENSUS_SOFT) >= 1:
+        bt["consensus"] = "SOFT"
+    else:
+        bt["consensus"] = "NONE"
 
+    # ── Detectar modo 2/3 ─────────────────────────────────────────────────────
+    # Solo intentamos 2/3 cuando hay datos para los 3 activos
+    if len(active_mids) == 3:
+        aligned, laggard = _classify_assets_23(active_mids, harm_active)
+        if aligned and laggard:
+            # Sides individuales: alineados → global_side, rezagado → contrario
+            opp_side = "DOWN" if global_side == "UP" else "UP"
+            sides = {s: global_side for s in aligned}
+            sides[laggard] = opp_side
+            bt["signal_mode"]  = "2/3"
+            bt["signal_sides"] = sides
+            log_event(
+                f"MODO 2/3 detectado — alineados={aligned} ({global_side}) "
+                f"rezagado={laggard} ({opp_side})"
+            )
+            return   # No sobreescribir con lógica 3/3
+
+    # Modo 3/3 estándar — todos entran por el mismo side
+    bt["signal_mode"]  = "3/3"
+    bt["signal_sides"] = {s: global_side for s in SYMBOLS}
+
+
+def _find_cheapest(mids: dict, h_avg: float):
+    """Alias local para mantener consistencia con la función global."""
+    return find_cheapest(mids, h_avg)
+
+
+# ═══════════════════════════════════════════════════════
+#  CONSTRUCCIÓN Y APERTURA DE POSICIONES
+# ═══════════════════════════════════════════════════════
 
 def _build_single_position(sym: str, side: str, secs: float,
                             harm_entry: float, gap_entry: float,
                             capital_before: float) -> dict | None:
     """
-    Construye una posición individual para un símbolo.
-    Retorna None si el activo no cumple los filtros de precio.
+    Construye una posición individual para un símbolo y side dados.
+    Retorna None si el activo no cumple los filtros de precio o está resuelto.
     """
     if side == "UP":
         entry_ask = markets[sym]["up_ask"]
@@ -582,10 +623,8 @@ def _build_single_position(sym: str, side: str, secs: float,
         log_event(f"SKIP {side} {sym} — ask inválido ({entry_ask:.4f})")
         return None
 
-    # Solo bloquear si el activo esta CONFIRMADAMENTE resuelto (5s sostenidos)
-    # Un tick momentaneo en 0.98/0.02 NO descarta la posicion
     if _is_confirmed_resolved(sym) is not None:
-        log_event(f"SKIP {side} {sym} — activo confirmado resuelto (5s sostenidos)")
+        log_event(f"SKIP {side} {sym} — activo confirmado resuelto")
         return None
 
     if entry_ask < ENTRY_MIN_PRICE:
@@ -607,6 +646,7 @@ def _build_single_position(sym: str, side: str, secs: float,
         "gap_entry":       gap_entry,
         "entry_ts":        datetime.now().isoformat(),
         "consensus_entry": bt["consensus"],
+        "signal_mode":     bt["signal_mode"],
         "peer_snaps":      {
             p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]}
             for p in SYMBOLS if p != sym
@@ -616,7 +656,6 @@ def _build_single_position(sym: str, side: str, secs: float,
             "condition_id":       markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
             "gamma_condition_id": markets[sym]["info"].get("gamma_condition_id") if markets[sym]["info"] else None,
             "market_slug":        markets[sym]["info"].get("market_slug", "") if markets[sym]["info"] else "",
-            # Token IDs para verificar resolución directamente en el CLOB (más rápido que Gamma)
             "up_token_id":        markets[sym]["info"].get("up_token_id") if markets[sym]["info"] else None,
             "down_token_id":      markets[sym]["info"].get("down_token_id") if markets[sym]["info"] else None,
         },
@@ -625,18 +664,27 @@ def _build_single_position(sym: str, side: str, secs: float,
 
 def check_entry():
     """
-    Abre posición en los 3 activos simultáneamente cuando se detecta
-    el armónico con consenso FULL y divergencia dentro del rango válido.
-    Todos entran por el mismo side (el del armónico).
+    Abre posiciones cuando se detecta señal válida.
+
+    Modo 3/3 (original):
+      - Requiere consenso FULL y divergencia dentro del rango.
+      - Todos los activos entran por el mismo side.
+
+    Modo 2/3 (nuevo):
+      - No requiere consenso FULL (los peers van en direcciones distintas
+        por definición — el consenso clásico no aplica).
+      - Requiere que la divergencia del activo más barato esté en rango.
+      - Los 2 alineados entran por el side global.
+      - El rezagado entra por el side contrario.
+      - Si el rezagado no pasa ENTRY_MIN_PRICE, se entran solo los 2.
     """
     if bt["traded_this_cycle"]:
         return
     if not bt["entry_window"]:
         return
-    if bt["consensus"] != "FULL":
-        bt["skipped"] += 1
-        return
     if not bt["signal_asset"]:
+        return
+    if bt["signal_mode"] == "NONE":
         return
 
     div_abs = abs(bt["signal_div"])
@@ -649,21 +697,30 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    side        = bt["signal_side"]
-    harm_entry  = bt["harm_up"] if side == "UP" else bt["harm_dn"]
+    # ── Modo 3/3: requiere consenso FULL ─────────────────────────────────────
+    if bt["signal_mode"] == "3/3":
+        if bt["consensus"] != "FULL":
+            bt["skipped"] += 1
+            return
+
+    global_side = bt["signal_side"]
+    harm_entry  = bt["harm_up"] if global_side == "UP" else bt["harm_dn"]
     gap_entry   = bt["signal_div"]
     secs        = min_secs_remaining() or 0
 
-    # Intentar abrir los 3
+    # Obtener el side de cada activo según el modo
+    sides_map = bt["signal_sides"]   # {sym: side}
+
     nuevas_posiciones = []
     for sym in SYMBOLS:
-        capital_before = bt["capital"]   # se va actualizando por posición
+        side           = sides_map.get(sym, global_side)
+        capital_before = bt["capital"]
         pos = _build_single_position(sym, side, secs, harm_entry, gap_entry, capital_before)
         if pos:
             bt["capital"] -= ENTRY_USD
             nuevas_posiciones.append(pos)
             log_event(
-                f"ENTRADA {side} {sym} @ ask={pos['entry_price']:.4f} | "
+                f"ENTRADA [{bt['signal_mode']}] {side} {sym} @ ask={pos['entry_price']:.4f} | "
                 f"div={gap_entry*100:+.1f}pts | arm={harm_entry:.4f} | "
                 f"shares={pos['shares']:.4f} | capital=${bt['capital']:.2f}"
             )
@@ -675,10 +732,16 @@ def check_entry():
 
     bt["positions"] = nuevas_posiciones
     bt["traded_this_cycle"] = True
-    log_event(f"BASKET ABIERTO — {len(nuevas_posiciones)}/3 posiciones en {side}")
+    log_event(
+        f"BASKET ABIERTO [{bt['signal_mode']}] — "
+        f"{len(nuevas_posiciones)}/3 posiciones"
+    )
     write_state()
 
 
+# ═══════════════════════════════════════════════════════
+#  RESOLUCIÓN
+# ═══════════════════════════════════════════════════════
 
 def _apply_resolution(pos, resolved, source="CLOB"):
     sym  = pos["asset"]
@@ -701,18 +764,13 @@ def _apply_resolution(pos, resolved, source="CLOB"):
     _record_trade(pos, resolved, outcome, pnl, source=source)
 
 
-RESOLUTION_CONFIRM_SAMPLES = 10   # 10 muestras x 0.5s = 5s sostenidos
+RESOLUTION_CONFIRM_SAMPLES = 10
 
 
 def _is_confirmed_resolved(sym):
-    """Retorna 'UP', 'DOWN' o None.
-    Solo resuelve si TODAS las ultimas RESOLUTION_CONFIRM_SAMPLES muestras
-    del mid_history superan los umbrales — evita falsos positivos por un
-    tick momentaneo en 0.98 cuando el mercado sigue activo.
-    """
     history = list(mid_history[sym])
     if len(history) < RESOLUTION_CONFIRM_SAMPLES:
-        return None  # historia insuficiente — no resolver todavia
+        return None
     recent = history[-RESOLUTION_CONFIRM_SAMPLES:]
     if all(v >= RESOLVED_UP_THRESH for v in recent):
         return "UP"
@@ -733,15 +791,11 @@ def check_resolution():
     cerradas = []
     for pos in bt["positions"]:
         sym = pos["asset"]
-
-        # Primero intentar confirmar por CLOB (precio sostenido 0.98/0.02 por 5s)
         resolved = _is_confirmed_resolved(sym)
         if resolved:
             _apply_resolution(pos, resolved)
             cerradas.append(pos)
             continue
-
-        # Mercado expirado sin confirmación CLOB → esperar a Gamma
         if market_expired or (secs is not None and secs <= 0):
             _move_to_pending(pos)
             cerradas.append(pos)
@@ -759,7 +813,9 @@ def check_resolution():
 
 def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
     exit_ts    = datetime.now().isoformat()
-    duration_s = round((datetime.fromisoformat(exit_ts) - datetime.fromisoformat(pos["entry_ts"])).total_seconds(), 1)
+    duration_s = round(
+        (datetime.fromisoformat(exit_ts) - datetime.fromisoformat(pos["entry_ts"])).total_seconds(), 1
+    )
     trade_number = bt["wins"] + bt["losses"]
 
     peers      = [s for s in SYMBOLS if s != pos["asset"]]
@@ -790,6 +846,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
         "asset":            pos["asset"],
         "side":             pos["side"],
         "consensus":        pos["consensus_entry"],
+        "signal_mode":      pos.get("signal_mode", "3/3"),
         "entry_ask":        round(pos["entry_price"], 6),
         "entry_bid":        round(pos["entry_bid"], 6),
         "entry_mid":        round(pos["entry_mid"], 6),
@@ -837,8 +894,6 @@ def _record_trade(pos, resolved, outcome, pnl, source="CLOB"):
     _save_log()
 
 
-
-
 def _save_log():
     total = bt["wins"] + bt["losses"]
     with open(LOG_FILE, "w") as f:
@@ -864,9 +919,9 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA v6 (basket 3 activos)")
+    log_event("basket.py iniciado — SIMULACION BINARIA v7 (armónico 2/3)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f}x3 = ${ENTRY_USD*3:.2f} por ciclo")
-    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.0%} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
+    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.0%} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s | Cierre a {ENTRY_CLOSE_SECS}s")
 
     restore_state_from_csv()
 
@@ -955,9 +1010,10 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v6")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v7")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f}x3 por ciclo")
-    log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.0f}pts  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
+    log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.0f}pts  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  Cierre: {ENTRY_CLOSE_SECS}s")
+    log.info(f"  Modo 2/3 lag threshold: {DIVERGENCE_23_LAG*100:.0f}pts")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
