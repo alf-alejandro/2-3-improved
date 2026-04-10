@@ -49,15 +49,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.05
-DIVERGENCE_MAX       = 0.14
+DIVERGENCE_THRESHOLD = 0.06
+DIVERGENCE_MAX       = 0.12
 # Umbral mínimo de divergencia inversa para considerar un activo como
 # "rezagado opuesto" en el modo 2/3. Si su mid supera la media armónica
 # del side global en más de este valor, se clasifica como rezagado.
 DIVERGENCE_23_LAG    = 0.03
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
-ENTRY_OPEN_SECS      = 60
+ENTRY_OPEN_SECS      = 65
 ENTRY_CLOSE_SECS     = 20   # era 30 → +10 s de ventana (ahora cierra a 20 s del fin)
 RESOLUTION_MAX_SECS  = 7
 
@@ -68,11 +68,11 @@ ENTRY_USD            = CAPITAL_TOTAL * ENTRY_PCT   # $1 por activo
 RESOLVED_UP_THRESH   = 0.98
 RESOLVED_DN_THRESH   = 0.02
 
-CONSENSUS_FULL       = 0.80
-CONSENSUS_SOFT       = 0.80
+CONSENSUS_FULL       = 0.77
+CONSENSUS_SOFT       = 0.66
 
-ENTRY_MIN_PRICE      = 0.65
-MID_HISTORY_SIZE     = 10
+ENTRY_MIN_PRICE      = 0.68
+MID_HISTORY_SIZE     = 5
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
